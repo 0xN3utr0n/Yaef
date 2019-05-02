@@ -23,15 +23,15 @@
 
 #include "Yaef.h"
 
-#define SYS_MMAP               	9
-#define SYS_MEMFD_CREATE 		319
-#define MFD_CLOEXEC 			1
+#define SYS_MMAP                9
+#define SYS_MEMFD_CREATE        319
+#define MFD_CLOEXEC             1
 
-#define RTLD_LAZY        		0x00001
+#define RTLD_LAZY               0x00001
 
-#define BUF_SIZE            	200
-#define INT30					0xCC
-#define TRACED					1
+#define BUF_SIZE                200
+#define INT30                   0xCC
+#define TRACED                  1
 
 #define MAX_STEPS               5
 #define DEBUG
