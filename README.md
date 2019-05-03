@@ -3,7 +3,7 @@ Inject an ELF x86_64 shared object into a remote process, and let
 it run as an a independent thread. If specified, use a fake name
 to deceive /proc/maps.
 
-All in all, it's a pretty sthealty & complete solution compared to other ones.
+All in all, it's a pretty sthealthy & complete solution compared to other ones.
 
 ### How does it work
  1. Attach & stop all running threads ([Ptrace](https://www.kernel.org/doc/Documentation/security/Yama.txt))
