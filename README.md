@@ -12,7 +12,7 @@ already compromised system.
  3. Hijack remote **__libc_dlopen_mode()** function and load the memfd file.
  4. Hijack remote **pthread_create()** function and call our malicious one.
 
-## Installing
+## Install
 ``` 
 git clone https://github.com/0xN3utr0n/Yaef.git
 cd Yaef
